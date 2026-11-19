@@ -143,10 +143,7 @@ function App() {
           <span className="brand-mark">ID</span>
           <span>Excel ID Converter</span>
         </a>
-        <span className="privacy-label">
-          <span className="privacy-dot" />
-          Files stay on your device
-        </span>
+        
       </header>
 
       <section className="content">
