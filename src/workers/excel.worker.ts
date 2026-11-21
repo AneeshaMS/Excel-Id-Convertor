@@ -1,86 +1,134 @@
+
 /// <reference lib="webworker" />
 import * as XLSX from "xlsx";
 import type { WorkerRequest, WorkerResponse } from "../types";
 
 const workerScope = self as DedicatedWorkerGlobalScope;
-const SEQUENCE_WIDTH = 1;
+
+const ID_PREFIX_LENGTH = 6;
+const SEQUENCE_WIDTH = 4;
+const DELIMITER = "|";
+
+/**
+ * Parse pipe-separated DAT content.
+ * Supports quoted values, escaped quotes and delimiters inside quotes.
+ */
+function parseDatFile(content: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const char = content[i];
+
+    if (char === '"') {
+      if (inQuotes && content[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === DELIMITER && !inQuotes) {
+      row.push(field);
+      field = "";
+    } else if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && content[i + 1] === "\n") {
+        i++;
+      }
+
+      row.push(field);
+
+      if (row.some((value) => value.trim() !== "")) {
+        rows.push(row);
+      }
+
+      row = [];
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+
+  // Add the last row.
+  row.push(field);
+
+  if (row.some((value) => value.trim() !== "")) {
+    rows.push(row);
+  }
+
+  return rows;
+}
 
 workerScope.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const startedAt = performance.now();
 
   try {
-    const workbook = XLSX.read(event.data.buffer, {
-      type: "array",
-      cellDates: false,
-      // We only export the first worksheet. SheetJS reads the workbook
-      // structure, then the conversion below touches only that worksheet.
-    });
+    // Read DAT file as text.
+    const content = new TextDecoder("utf-8").decode(event.data.buffer);
 
-    const firstSheetName = workbook.SheetNames[0];
-    if (!firstSheetName) {
-      throw new Error("The workbook does not contain a worksheet.");
+    // Remove BOM if present.
+    const cleanedContent = content.replace(/^\uFEFF/, "");
+
+    const rows = parseDatFile(cleanedContent);
+
+    if (rows.length < 2) {
+      throw new Error("The DAT file contains no data rows.");
     }
 
-    const worksheet = workbook.Sheets[firstSheetName];
-    if (!worksheet || !worksheet["!ref"]) {
-      throw new Error("The first worksheet is empty.");
-    }
-
-    const range = XLSX.utils.decode_range(worksheet["!ref"]);
-
-    // The first worksheet row is the header. Data starts on the next row.
-    const firstDataRow = Math.max(range.s.r + 1, 1);
     const timestamp = Date.now();
     let recordCount = 0;
 
-    for (let row = firstDataRow; row <= range.e.r; row += 1) {
-      let rowHasData = false;
+    // First row contains headers.
+    const headers = rows[0];
+    const dataRows = rows.slice(1);
 
-      for (let column = range.s.c; column <= range.e.c; column += 1) {
-        const address = XLSX.utils.encode_cell({ r: row, c: column });
-        const cell = worksheet[address];
+    for (let i = 0; i < dataRows.length; i++) {
+      const row = dataRows[i];
 
-        if (
-          cell &&
-          cell.v !== undefined &&
-          cell.v !== null &&
-          String(cell.v).trim() !== ""
-        ) {
-          rowHasData = true;
-          break;
-        }
+      // Ignore completely empty rows.
+      if (row.every((value) => value.trim() === "")) {
+        continue;
       }
 
-      // Ignore fully empty rows; do not create IDs for them.
-      if (!rowHasData) continue;
+      const originalId = row[0]?.trim();
 
-      recordCount += 1;
-     const idAddress = XLSX.utils.encode_cell({ r: row, c: 0 });
+      if (!originalId) {
+        throw new Error(
+          `Missing ID in Column A at data row ${i + 2}`
+        );
+      }
 
-// Get original ID
-const originalId = worksheet[idAddress]?.v;
+      recordCount++;
 
-if (originalId === undefined || originalId === null || String(originalId).trim() === "") {
-  throw new Error(`Missing ID in Column A at row ${row + 1}`);
-}
+      // Extract first 6 characters as ID prefix.
+      const prefix = originalId.slice(0, ID_PREFIX_LENGTH);
 
-// Extract first 7 characters
-const prefix = String(originalId).trim().slice(0, 7);
+      // Generate unique ID.
+      const sequence = String(recordCount).padStart(
+        SEQUENCE_WIDTH,
+        "0"
+      );
 
-// Generate new unique ID
-const newId = `${prefix}${timestamp}${String(recordCount).padStart(SEQUENCE_WIDTH, "0")}`;
+      const newId = `${prefix}${timestamp}${sequence}`;
 
-// Update Column A
-worksheet[idAddress] = {
-  t: "s",
-  v: newId,
-};
+      // Replace Column A.
+      row[0] = newId;
     }
 
     if (recordCount === 0) {
-      throw new Error("No data rows were found below the header row.");
+      throw new Error("No valid data records found.");
     }
 
+    // Convert data into an Excel worksheet.
+    const worksheet = XLSX.utils.aoa_to_sheet([
+      headers,
+      ...dataRows.filter((row) =>
+        row.some((value) => value.trim() !== "")
+      ),
+    ]);
+
+    // Generate CSV.
     const csv = XLSX.utils.sheet_to_csv(worksheet, {
       FS: ",",
       RS: "\r\n",
@@ -95,13 +143,14 @@ worksheet[idAddress] = {
     };
 
     workerScope.postMessage(response);
+
   } catch (error) {
     const response: WorkerResponse = {
       type: "error",
       message:
         error instanceof Error
           ? error.message
-          : "The file could not be processed.",
+          : "The DAT file could not be processed.",
     };
 
     workerScope.postMessage(response);
